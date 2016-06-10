@@ -53,6 +53,9 @@ project/plugins/lib_managed/
 project/plugins/project/build.properties
 project/plugins/src_managed/
 project/plugins/target/
+project/.boot
+project/.ivy
+project/.sbtboot
 python/lib/pyspark.zip
 reports/
 scalastyle-on-compile.generated.xml
