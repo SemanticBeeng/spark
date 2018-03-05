@@ -23,8 +23,8 @@ import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.types.IntegerType
 
 /**
- * This suite is used to test [[LogicalPlan]]'s `transformUp` plus analysis barrier and make sure
- * it can correctly skip sub-trees that have already been marked as analyzed.
+ * This suite is used to test [[LogicalPlan]]'s `transformUp/transformDown` plus analysis barrier
+ * and make sure it can correctly skip sub-trees that have already been analyzed.
  */
 class LogicalPlanSuite extends SparkFunSuite {
   private var invocationCount = 0
@@ -42,6 +42,10 @@ class LogicalPlanSuite extends SparkFunSuite {
     plan transformUp function
 
     assert(invocationCount === 1)
+
+    invocationCount = 0
+    plan transformDown function
+    assert(invocationCount === 1)
   }
 
   test("transformUp runs on operators recursively") {
@@ -50,6 +54,10 @@ class LogicalPlanSuite extends SparkFunSuite {
     plan transformUp function
 
     assert(invocationCount === 2)
+
+    invocationCount = 0
+    plan transformDown function
+    assert(invocationCount === 2)
   }
 
   test("transformUp skips all ready resolved plans wrapped in analysis barrier") {
@@ -57,6 +65,10 @@ class LogicalPlanSuite extends SparkFunSuite {
     val plan = AnalysisBarrier(Project(Nil, Project(Nil, testRelation)))
     plan transformUp function
 
+    assert(invocationCount === 0)
+
+    invocationCount = 0
+    plan transformDown function
     assert(invocationCount === 0)
   }
 
@@ -67,14 +79,16 @@ class LogicalPlanSuite extends SparkFunSuite {
     plan2 transformUp function
 
     assert(invocationCount === 1)
+
+    invocationCount = 0
+    plan2 transformDown function
+    assert(invocationCount === 1)
   }
 
   test("isStreaming") {
     val relation = LocalRelation(AttributeReference("a", IntegerType, nullable = true)())
-    val incrementalRelation = new LocalRelation(
-      Seq(AttributeReference("a", IntegerType, nullable = true)())) {
-      override def isStreaming(): Boolean = true
-    }
+    val incrementalRelation = LocalRelation(
+      Seq(AttributeReference("a", IntegerType, nullable = true)()), isStreaming = true)
 
     case class TestBinaryRelation(left: LogicalPlan, right: LogicalPlan) extends BinaryNode {
       override def output: Seq[Attribute] = left.output ++ right.output
