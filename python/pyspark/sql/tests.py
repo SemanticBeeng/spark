@@ -3901,6 +3901,44 @@ class PandasUDFTests(ReusedSQLTestCase):
                 def foo(k, v):
                     return k
 
+    def test_stopiteration_in_udf(self):
+        from pyspark.sql.functions import udf, pandas_udf, PandasUDFType
+        from py4j.protocol import Py4JJavaError
+
+        def foo(x):
+            raise StopIteration()
+
+        def foofoo(x, y):
+            raise StopIteration()
+
+        exc_message = "Caught StopIteration thrown from user's code; failing the task"
+        df = self.spark.range(0, 100)
+
+        # plain udf (test for SPARK-23754)
+        self.assertRaisesRegexp(
+            Py4JJavaError,
+            exc_message,
+            df.withColumn('v', udf(foo)('id')).collect
+        )
+
+        # pandas scalar udf
+        self.assertRaisesRegexp(
+            Py4JJavaError,
+            exc_message,
+            df.withColumn(
+                'v', pandas_udf(foo, 'double', PandasUDFType.SCALAR)('id')
+            ).collect
+        )
+
+        # pandas grouped map
+        self.assertRaisesRegexp(
+            Py4JJavaError,
+            exc_message,
+            df.groupBy('id').apply(
+                pandas_udf(foo, df.schema, PandasUDFType.GROUPED_MAP)
+            ).collect
+        )
+
 
 @unittest.skipIf(
     not _have_pandas or not _have_pyarrow,
