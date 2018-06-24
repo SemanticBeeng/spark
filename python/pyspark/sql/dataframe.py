@@ -78,6 +78,9 @@ class DataFrame(object):
         self.is_cached = False
         self._schema = None  # initialized lazily
         self._lazy_rdd = None
+        # Check whether _repr_html is supported or not, we use it to avoid calling _jdf twice
+        # by __repr__ and _repr_html_ while eager evaluation opened.
+        self._support_repr_html = False
 
     @property
     @since(1.3)
@@ -351,8 +354,68 @@ class DataFrame(object):
         else:
             print(self._jdf.showString(n, int(truncate), vertical))
 
+    @property
+    def _eager_eval(self):
+        """Returns true if the eager evaluation enabled.
+        """
+        return self.sql_ctx.getConf(
+            "spark.sql.repl.eagerEval.enabled", "false").lower() == "true"
+
+    @property
+    def _max_num_rows(self):
+        """Returns the max row number for eager evaluation.
+        """
+        return int(self.sql_ctx.getConf(
+            "spark.sql.repl.eagerEval.maxNumRows", "20"))
+
+    @property
+    def _truncate(self):
+        """Returns the truncate length for eager evaluation.
+        """
+        return int(self.sql_ctx.getConf(
+            "spark.sql.repl.eagerEval.truncate", "20"))
+
     def __repr__(self):
-        return "DataFrame[%s]" % (", ".join("%s: %s" % c for c in self.dtypes))
+        if not self._support_repr_html and self._eager_eval:
+            vertical = False
+            return self._jdf.showString(
+                self._max_num_rows, self._truncate, vertical)
+        else:
+            return "DataFrame[%s]" % (", ".join("%s: %s" % c for c in self.dtypes))
+
+    def _repr_html_(self):
+        """Returns a dataframe with html code when you enabled eager evaluation
+        by 'spark.sql.repl.eagerEval.enabled', this only called by REPL you are
+        using support eager evaluation with HTML.
+        """
+        import cgi
+        if not self._support_repr_html:
+            self._support_repr_html = True
+        if self._eager_eval:
+            max_num_rows = max(self._max_num_rows, 0)
+            vertical = False
+            sock_info = self._jdf.getRowsToPython(
+                max_num_rows, self._truncate, vertical)
+            rows = list(_load_from_socket(sock_info, BatchedSerializer(PickleSerializer())))
+            head = rows[0]
+            row_data = rows[1:]
+            has_more_data = len(row_data) > max_num_rows
+            row_data = row_data[:max_num_rows]
+
+            html = "<table border='1'>\n"
+            # generate table head
+            html += "<tr><th>%s</th></tr>\n" % "</th><th>".join(map(lambda x: cgi.escape(x), head))
+            # generate table rows
+            for row in row_data:
+                html += "<tr><td>%s</td></tr>\n" % "</td><td>".join(
+                    map(lambda x: cgi.escape(x), row))
+            html += "</table>\n"
+            if has_more_data:
+                html += "only showing top %d %s\n" % (
+                    max_num_rows, "row" if max_num_rows == 1 else "rows")
+            return html
+        else:
+            return None
 
     @since(2.1)
     def checkpoint(self, eager=True):
@@ -463,8 +526,8 @@ class DataFrame(object):
         [Row(age=2, name=u'Alice'), Row(age=5, name=u'Bob')]
         """
         with SCCallSiteSync(self._sc) as css:
-            port = self._jdf.collectToPython()
-        return list(_load_from_socket(port, BatchedSerializer(PickleSerializer())))
+            sock_info = self._jdf.collectToPython()
+        return list(_load_from_socket(sock_info, BatchedSerializer(PickleSerializer())))
 
     @ignore_unicode_prefix
     @since(2.0)
@@ -477,8 +540,8 @@ class DataFrame(object):
         [Row(age=2, name=u'Alice'), Row(age=5, name=u'Bob')]
         """
         with SCCallSiteSync(self._sc) as css:
-            port = self._jdf.toPythonIterator()
-        return _load_from_socket(port, BatchedSerializer(PickleSerializer()))
+            sock_info = self._jdf.toPythonIterator()
+        return _load_from_socket(sock_info, BatchedSerializer(PickleSerializer()))
 
     @ignore_unicode_prefix
     @since(1.3)
@@ -1975,6 +2038,8 @@ class DataFrame(object):
         .. note:: This method should only be used if the resulting Pandas's DataFrame is expected
             to be small, as all the data is loaded into the driver's memory.
 
+        .. note:: Usage with spark.sql.execution.arrow.enabled=True is experimental.
+
         >>> df.toPandas()  # doctest: +SKIP
            age   name
         0    2  Alice
@@ -1992,55 +2057,92 @@ class DataFrame(object):
             timezone = None
 
         if self.sql_ctx.getConf("spark.sql.execution.arrow.enabled", "false").lower() == "true":
+            use_arrow = True
             try:
-                from pyspark.sql.types import _check_dataframe_convert_date, \
-                    _check_dataframe_localize_timestamps, to_arrow_schema
+                from pyspark.sql.types import to_arrow_schema
                 from pyspark.sql.utils import require_minimum_pyarrow_version
+
                 require_minimum_pyarrow_version()
-                import pyarrow
                 to_arrow_schema(self.schema)
-                tables = self._collectAsArrow()
-                if tables:
-                    table = pyarrow.concat_tables(tables)
-                    pdf = table.to_pandas()
-                    pdf = _check_dataframe_convert_date(pdf, self.schema)
-                    return _check_dataframe_localize_timestamps(pdf, timezone)
-                else:
-                    return pd.DataFrame.from_records([], columns=self.columns)
             except Exception as e:
-                msg = (
-                    "Note: toPandas attempted Arrow optimization because "
-                    "'spark.sql.execution.arrow.enabled' is set to true. Please set it to false "
-                    "to disable this.")
-                raise RuntimeError("%s\n%s" % (_exception_message(e), msg))
+
+                if self.sql_ctx.getConf("spark.sql.execution.arrow.fallback.enabled", "true") \
+                        .lower() == "true":
+                    msg = (
+                        "toPandas attempted Arrow optimization because "
+                        "'spark.sql.execution.arrow.enabled' is set to true; however, "
+                        "failed by the reason below:\n  %s\n"
+                        "Attempting non-optimization as "
+                        "'spark.sql.execution.arrow.fallback.enabled' is set to "
+                        "true." % _exception_message(e))
+                    warnings.warn(msg)
+                    use_arrow = False
+                else:
+                    msg = (
+                        "toPandas attempted Arrow optimization because "
+                        "'spark.sql.execution.arrow.enabled' is set to true, but has reached "
+                        "the error below and will not continue because automatic fallback "
+                        "with 'spark.sql.execution.arrow.fallback.enabled' has been set to "
+                        "false.\n  %s" % _exception_message(e))
+                    warnings.warn(msg)
+                    raise
+
+            # Try to use Arrow optimization when the schema is supported and the required version
+            # of PyArrow is found, if 'spark.sql.execution.arrow.enabled' is enabled.
+            if use_arrow:
+                try:
+                    from pyspark.sql.types import _check_dataframe_convert_date, \
+                        _check_dataframe_localize_timestamps
+                    import pyarrow
+
+                    tables = self._collectAsArrow()
+                    if tables:
+                        table = pyarrow.concat_tables(tables)
+                        pdf = table.to_pandas()
+                        pdf = _check_dataframe_convert_date(pdf, self.schema)
+                        return _check_dataframe_localize_timestamps(pdf, timezone)
+                    else:
+                        return pd.DataFrame.from_records([], columns=self.columns)
+                except Exception as e:
+                    # We might have to allow fallback here as well but multiple Spark jobs can
+                    # be executed. So, simply fail in this case for now.
+                    msg = (
+                        "toPandas attempted Arrow optimization because "
+                        "'spark.sql.execution.arrow.enabled' is set to true, but has reached "
+                        "the error below and can not continue. Note that "
+                        "'spark.sql.execution.arrow.fallback.enabled' does not have an effect "
+                        "on failures in the middle of computation.\n  %s" % _exception_message(e))
+                    warnings.warn(msg)
+                    raise
+
+        # Below is toPandas without Arrow optimization.
+        pdf = pd.DataFrame.from_records(self.collect(), columns=self.columns)
+
+        dtype = {}
+        for field in self.schema:
+            pandas_type = _to_corrected_pandas_type(field.dataType)
+            # SPARK-21766: if an integer field is nullable and has null values, it can be
+            # inferred by pandas as float column. Once we convert the column with NaN back
+            # to integer type e.g., np.int16, we will hit exception. So we use the inferred
+            # float type, not the corrected type from the schema in this case.
+            if pandas_type is not None and \
+                not(isinstance(field.dataType, IntegralType) and field.nullable and
+                    pdf[field.name].isnull().any()):
+                dtype[field.name] = pandas_type
+
+        for f, t in dtype.items():
+            pdf[f] = pdf[f].astype(t, copy=False)
+
+        if timezone is None:
+            return pdf
         else:
-            pdf = pd.DataFrame.from_records(self.collect(), columns=self.columns)
-
-            dtype = {}
+            from pyspark.sql.types import _check_series_convert_timestamps_local_tz
             for field in self.schema:
-                pandas_type = _to_corrected_pandas_type(field.dataType)
-                # SPARK-21766: if an integer field is nullable and has null values, it can be
-                # inferred by pandas as float column. Once we convert the column with NaN back
-                # to integer type e.g., np.int16, we will hit exception. So we use the inferred
-                # float type, not the corrected type from the schema in this case.
-                if pandas_type is not None and \
-                    not(isinstance(field.dataType, IntegralType) and field.nullable and
-                        pdf[field.name].isnull().any()):
-                    dtype[field.name] = pandas_type
-
-            for f, t in dtype.items():
-                pdf[f] = pdf[f].astype(t, copy=False)
-
-            if timezone is None:
-                return pdf
-            else:
-                from pyspark.sql.types import _check_series_convert_timestamps_local_tz
-                for field in self.schema:
-                    # TODO: handle nested timestamps, such as ArrayType(TimestampType())?
-                    if isinstance(field.dataType, TimestampType):
-                        pdf[field.name] = \
-                            _check_series_convert_timestamps_local_tz(pdf[field.name], timezone)
-                return pdf
+                # TODO: handle nested timestamps, such as ArrayType(TimestampType())?
+                if isinstance(field.dataType, TimestampType):
+                    pdf[field.name] = \
+                        _check_series_convert_timestamps_local_tz(pdf[field.name], timezone)
+            return pdf
 
     def _collectAsArrow(self):
         """
@@ -2050,8 +2152,8 @@ class DataFrame(object):
         .. note:: Experimental.
         """
         with SCCallSiteSync(self._sc) as css:
-            port = self._jdf.collectAsArrowToPython()
-        return list(_load_from_socket(port, ArrowSerializer()))
+            sock_info = self._jdf.collectAsArrowToPython()
+        return list(_load_from_socket(sock_info, ArrowSerializer()))
 
     ##########################################################################################
     # Pandas compatibility
@@ -2195,7 +2297,7 @@ def _test():
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE | doctest.REPORT_NDIFF)
     globs['sc'].stop()
     if failure_count:
-        exit(-1)
+        sys.exit(-1)
 
 
 if __name__ == "__main__":
