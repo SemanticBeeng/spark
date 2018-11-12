@@ -15,22 +15,19 @@
  * limitations under the License.
  */
 
-package org.apache.spark.network.shuffle;
+package org.apache.spark.sql.internal
 
-import java.io.File;
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.{LocalSparkSession, SparkSession}
 
-/**
- * A manager to create temp block files to reduce the memory usage and also clean temp
- * files when they won't be used any more.
- */
-public interface TempFileManager {
+class SQLConfGetterSuite extends SparkFunSuite with LocalSparkSession {
 
-  /** Create a temp block file. */
-  File createTempFile();
-
-  /**
-   * Register a temp file to clean up when it won't be used any more. Return whether the
-   * file is registered successfully. If `false`, the caller should clean up the file by itself.
-   */
-  boolean registerTempFileToClean(File file);
+  test("SPARK-25076: SQLConf should not be retrieved from a stopped SparkSession") {
+    spark = SparkSession.builder().master("local").getOrCreate()
+    assert(SQLConf.get eq spark.sessionState.conf,
+      "SQLConf.get should get the conf from the active spark session.")
+    spark.stop()
+    assert(SQLConf.get eq SQLConf.getFallbackConf,
+      "SQLConf.get should not get conf from a stopped spark session.")
+  }
 }
