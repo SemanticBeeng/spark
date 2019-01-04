@@ -17,6 +17,8 @@
 .idea/
 .idea_modules/
 .project
+project/.boot/
+project/.sbtboot/
 .pydevproject
 .scala_dependencies
 .settings
