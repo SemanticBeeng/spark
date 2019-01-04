@@ -24,7 +24,7 @@ import java.util.{Calendar, GregorianCalendar, Properties}
 import org.h2.jdbc.JdbcSQLException
 import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
 
-import org.apache.spark.{SparkException, SparkFunSuite}
+import org.apache.spark.SparkException
 import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
@@ -54,6 +54,20 @@ class JDBCSuite extends QueryTest
     override def getCatalystType(
         sqlType: Int, typeName: String, size: Int, md: MetadataBuilder): Option[DataType] =
       Some(StringType)
+  }
+
+  val testH2DialectTinyInt = new JdbcDialect {
+    override def canHandle(url: String): Boolean = url.startsWith("jdbc:h2")
+    override def getCatalystType(
+        sqlType: Int,
+        typeName: String,
+        size: Int,
+        md: MetadataBuilder): Option[DataType] = {
+      sqlType match {
+        case java.sql.Types.TINYINT => Some(ByteType)
+        case _ => None
+      }
+    }
   }
 
   before {
@@ -242,6 +256,17 @@ class JDBCSuite extends QueryTest
     conn.prepareStatement("CREATE TABLE test.partition (THEID INTEGER, `THE ID` INTEGER) " +
       "AS SELECT 1, 1")
       .executeUpdate()
+    conn.commit()
+
+    conn.prepareStatement("CREATE TABLE test.datetime (d DATE, t TIMESTAMP)").executeUpdate()
+    conn.prepareStatement(
+      "INSERT INTO test.datetime VALUES ('2018-07-06', '2018-07-06 05:50:00.0')").executeUpdate()
+    conn.prepareStatement(
+      "INSERT INTO test.datetime VALUES ('2018-07-06', '2018-07-06 08:10:08.0')").executeUpdate()
+    conn.prepareStatement(
+      "INSERT INTO test.datetime VALUES ('2018-07-08', '2018-07-08 13:32:01.0')").executeUpdate()
+    conn.prepareStatement(
+      "INSERT INTO test.datetime VALUES ('2018-07-12', '2018-07-12 09:51:15.0')").executeUpdate()
     conn.commit()
 
     // Untested: IDENTITY, OTHER, UUID, ARRAY, and GEOMETRY types.
@@ -680,6 +705,17 @@ class JDBCSuite extends QueryTest
     assert(rows(0).get(0).isInstanceOf[String])
     assert(rows(0).get(1).isInstanceOf[String])
     JdbcDialects.unregisterDialect(testH2Dialect)
+  }
+
+  test("Map TINYINT to ByteType via JdbcDialects") {
+    JdbcDialects.registerDialect(testH2DialectTinyInt)
+    val df = spark.read.jdbc(urlWithUserAndPass, "test.inttypes", new Properties())
+    val rows = df.collect()
+    assert(rows.length === 2)
+    assert(rows(0).get(2).isInstanceOf[Byte])
+    assert(rows(0).getByte(2) === 3)
+    assert(rows(1).isNullAt(2))
+    JdbcDialects.unregisterDialect(testH2DialectTinyInt)
   }
 
   test("Default jdbc dialect registration") {
@@ -1337,9 +1373,13 @@ class JDBCSuite extends QueryTest
          |the partition columns using the supplied subquery alias to resolve any ambiguity.
          |Example :
          |spark.read.format("jdbc")
-         |        .option("dbtable", "(select c1, c2 from t1) as subq")
-         |        .option("partitionColumn", "subq.c1"
-         |        .load()
+         |  .option("url", jdbcUrl)
+         |  .option("dbtable", "(select c1, c2 from t1) as subq")
+         |  .option("partitionColumn", "c1")
+         |  .option("lowerBound", "1")
+         |  .option("upperBound", "100")
+         |  .option("numPartitions", "3")
+         |  .load()
      """.stripMargin
     val e5 = intercept[RuntimeException] {
       sql(
@@ -1375,7 +1415,71 @@ class JDBCSuite extends QueryTest
     checkAnswer(
       sql("select name, theid from queryOption"),
       Row("fred", 1) :: Nil)
+  }
 
+  test("SPARK-22814 support date/timestamp types in partitionColumn") {
+    val expectedResult = Seq(
+      ("2018-07-06", "2018-07-06 05:50:00.0"),
+      ("2018-07-06", "2018-07-06 08:10:08.0"),
+      ("2018-07-08", "2018-07-08 13:32:01.0"),
+      ("2018-07-12", "2018-07-12 09:51:15.0")
+    ).map { case (date, timestamp) =>
+      Row(Date.valueOf(date), Timestamp.valueOf(timestamp))
+    }
+
+    // DateType partition column
+    val df1 = spark.read.format("jdbc")
+      .option("url", urlWithUserAndPass)
+      .option("dbtable", "TEST.DATETIME")
+      .option("partitionColumn", "d")
+      .option("lowerBound", "2018-07-06")
+      .option("upperBound", "2018-07-20")
+      .option("numPartitions", 3)
+      .load()
+
+    df1.logicalPlan match {
+      case LogicalRelation(JDBCRelation(_, parts, _), _, _, _) =>
+        val whereClauses = parts.map(_.asInstanceOf[JDBCPartition].whereClause).toSet
+        assert(whereClauses === Set(
+          """"D" < '2018-07-10' or "D" is null""",
+          """"D" >= '2018-07-10' AND "D" < '2018-07-14'""",
+          """"D" >= '2018-07-14'"""))
+    }
+    checkAnswer(df1, expectedResult)
+
+    // TimestampType partition column
+    val df2 = spark.read.format("jdbc")
+      .option("url", urlWithUserAndPass)
+      .option("dbtable", "TEST.DATETIME")
+      .option("partitionColumn", "t")
+      .option("lowerBound", "2018-07-04 03:30:00.0")
+      .option("upperBound", "2018-07-27 14:11:05.0")
+      .option("numPartitions", 2)
+      .load()
+
+    df2.logicalPlan match {
+      case LogicalRelation(JDBCRelation(_, parts, _), _, _, _) =>
+        val whereClauses = parts.map(_.asInstanceOf[JDBCPartition].whereClause).toSet
+        assert(whereClauses === Set(
+          """"T" < '2018-07-15 20:50:32.5' or "T" is null""",
+          """"T" >= '2018-07-15 20:50:32.5'"""))
+    }
+    checkAnswer(df2, expectedResult)
+  }
+
+  test("throws an exception for unsupported partition column types") {
+    val errMsg = intercept[AnalysisException] {
+      spark.read.format("jdbc")
+        .option("url", urlWithUserAndPass)
+        .option("dbtable", "TEST.PEOPLE")
+        .option("partitionColumn", "name")
+        .option("lowerBound", "aaa")
+        .option("upperBound", "zzz")
+        .option("numPartitions", 2)
+        .load()
+    }.getMessage
+    assert(errMsg.contains(
+      "Partition column type should be numeric, date, or timestamp, but string found."))
   }
 
   test("SPARK-24288: Enable preventing predicate pushdown") {

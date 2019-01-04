@@ -34,6 +34,7 @@ class ColumnPruningSuite extends PlanTest {
     val batches = Batch("Column pruning", FixedPoint(100),
       PushDownPredicate,
       ColumnPruning,
+      RemoveNoopOperators,
       CollapseProject) :: Nil
   }
 
@@ -180,10 +181,10 @@ class ColumnPruningSuite extends PlanTest {
 
   test("Column pruning on except/intersect/distinct") {
     val input = LocalRelation('a.int, 'b.string, 'c.double)
-    val query = Project('a :: Nil, Except(input, input)).analyze
+    val query = Project('a :: Nil, Except(input, input, isAll = false)).analyze
     comparePlans(Optimize.execute(query), query)
 
-    val query2 = Project('a :: Nil, Intersect(input, input)).analyze
+    val query2 = Project('a :: Nil, Intersect(input, input, isAll = false)).analyze
     comparePlans(Optimize.execute(query2), query2)
     val query3 = Project('a :: Nil, Distinct(input)).analyze
     comparePlans(Optimize.execute(query3), query3)
@@ -340,10 +341,8 @@ class ColumnPruningSuite extends PlanTest {
   test("Column pruning on Union") {
     val input1 = LocalRelation('a.int, 'b.string, 'c.double)
     val input2 = LocalRelation('c.int, 'd.string, 'e.double)
-    val query = Project('b :: Nil,
-      Union(input1 :: input2 :: Nil)).analyze
-    val expected = Project('b :: Nil,
-      Union(Project('b :: Nil, input1) :: Project('d :: Nil, input2) :: Nil)).analyze
+    val query = Project('b :: Nil, Union(input1 :: input2 :: Nil)).analyze
+    val expected = Union(Project('b :: Nil, input1) :: Project('d :: Nil, input2) :: Nil).analyze
     comparePlans(Optimize.execute(query), expected)
   }
 

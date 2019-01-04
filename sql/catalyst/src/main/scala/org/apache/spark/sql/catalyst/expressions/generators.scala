@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 /**
@@ -101,7 +102,7 @@ case class UserDefinedGenerator(
     inputRow = new InterpretedProjection(children)
     convertToScala = {
       val inputSchema = StructType(children.map { e =>
-        StructField(e.simpleString, e.dataType, nullable = true)
+        StructField(e.simpleString(SQLConf.get.maxToStringFields), e.dataType, nullable = true)
       })
       CatalystTypeConverters.createToScalaConverter(inputSchema)
     }.asInstanceOf[InternalRow => Row]
@@ -224,6 +225,32 @@ case class Stack(children: Seq[Expression]) extends Generator {
 }
 
 /**
+ * Replicate the row N times. N is specified as the first argument to the function.
+ * This is an internal function solely used by optimizer to rewrite EXCEPT ALL AND
+ * INTERSECT ALL queries.
+ */
+case class ReplicateRows(children: Seq[Expression]) extends Generator with CodegenFallback {
+  private lazy val numColumns = children.length - 1 // remove the multiplier value from output.
+
+  override def elementSchema: StructType =
+    StructType(children.tail.zipWithIndex.map {
+      case (e, index) => StructField(s"col$index", e.dataType)
+    })
+
+  override def eval(input: InternalRow): TraversableOnce[InternalRow] = {
+    val numRows = children.head.eval(input).asInstanceOf[Long]
+    val values = children.tail.map(_.eval(input)).toArray
+    Range.Long(0, numRows, 1).map { _ =>
+      val fields = new Array[Any](numColumns)
+      for (col <- 0 until numColumns) {
+        fields.update(col, values(col))
+      }
+      InternalRow(fields: _*)
+    }
+  }
+}
+
+/**
  * Wrapper around another generator to specify outer behavior. This is used to implement functions
  * such as explode_outer. This expression gets replaced during analysis.
  */
@@ -232,7 +259,7 @@ case class GeneratorOuter(child: Generator) extends UnaryExpression with Generat
     throw new UnsupportedOperationException(s"Cannot evaluate expression: $this")
 
   final override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
-    throw new UnsupportedOperationException(s"Cannot evaluate expression: $this")
+    throw new UnsupportedOperationException(s"Cannot generate code for expression: $this")
 
   override def elementSchema: StructType = child.elementSchema
 
