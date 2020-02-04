@@ -17,11 +17,16 @@
 
 package org.apache.spark.sql.expressions
 
-import org.apache.spark.annotation.Stable
-import org.apache.spark.sql.Column
+import scala.reflect.runtime.universe.TypeTag
+
+import org.apache.spark.annotation.{Experimental, Stable}
+import org.apache.spark.sql.{Column, Encoder}
 import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.catalyst.expressions.ScalaUDF
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.expressions.{Expression, ScalaUDF}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete}
+import org.apache.spark.sql.execution.aggregate.ScalaAggregator
+import org.apache.spark.sql.types.{AnyDataType, DataType}
 
 /**
  * A user-defined function. To create one, use the `udf` functions in `functions`.
@@ -88,40 +93,39 @@ sealed abstract class UserDefinedFunction {
 private[sql] case class SparkUserDefinedFunction(
     f: AnyRef,
     dataType: DataType,
-    inputTypes: Option[Seq[DataType]],
-    nullableTypes: Option[Seq[Boolean]],
+    inputSchemas: Seq[Option[ScalaReflection.Schema]],
     name: Option[String] = None,
     nullable: Boolean = true,
     deterministic: Boolean = true) extends UserDefinedFunction {
 
   @scala.annotation.varargs
   override def apply(exprs: Column*): Column = {
-    // TODO: make sure this class is only instantiated through `SparkUserDefinedFunction.create()`
-    // and `nullableTypes` is always set.
-    if (inputTypes.isDefined) {
-      assert(inputTypes.get.length == nullableTypes.get.length)
-    }
-
-    val inputsNullSafe = nullableTypes.getOrElse {
-      ScalaReflection.getParameterTypeNullability(f)
-    }
-
-    Column(ScalaUDF(
-      f,
-      dataType,
-      exprs.map(_.expr),
-      inputsNullSafe,
-      inputTypes.getOrElse(Nil),
-      udfName = name,
-      nullable = nullable,
-      udfDeterministic = deterministic))
+    Column(createScalaUDF(exprs.map(_.expr)))
   }
 
-  override def withName(name: String): UserDefinedFunction = {
+  private[sql] def createScalaUDF(exprs: Seq[Expression]): ScalaUDF = {
+    // It's possible that some of the inputs don't have a specific type(e.g. `Any`),  skip type
+    // check.
+    val inputTypes = inputSchemas.map(_.map(_.dataType).getOrElse(AnyDataType))
+    // `ScalaReflection.Schema.nullable` is false iff the type is primitive. Also `Any` is not
+    // primitive.
+    val inputsPrimitive = inputSchemas.map(_.map(!_.nullable).getOrElse(false))
+    ScalaUDF(
+      f,
+      dataType,
+      exprs,
+      inputsPrimitive,
+      inputTypes,
+      udfName = name,
+      nullable = nullable,
+      udfDeterministic = deterministic)
+  }
+
+  override def withName(name: String): SparkUserDefinedFunction = {
     copy(name = Option(name))
   }
 
-  override def asNonNullable(): UserDefinedFunction = {
+  override def asNonNullable(): SparkUserDefinedFunction = {
     if (!nullable) {
       this
     } else {
@@ -129,7 +133,7 @@ private[sql] case class SparkUserDefinedFunction(
     }
   }
 
-  override def asNondeterministic(): UserDefinedFunction = {
+  override def asNondeterministic(): SparkUserDefinedFunction = {
     if (!deterministic) {
       this
     } else {
@@ -138,18 +142,41 @@ private[sql] case class SparkUserDefinedFunction(
   }
 }
 
-private[sql] object SparkUserDefinedFunction {
+private[sql] case class UserDefinedAggregator[IN, BUF, OUT](
+    aggregator: Aggregator[IN, BUF, OUT],
+    inputEncoder: Encoder[IN],
+    name: Option[String] = None,
+    nullable: Boolean = true,
+    deterministic: Boolean = true) extends UserDefinedFunction {
 
-  def create(
-      f: AnyRef,
-      dataType: DataType,
-      inputSchemas: Seq[Option[ScalaReflection.Schema]]): UserDefinedFunction = {
-    val inputTypes = if (inputSchemas.contains(None)) {
-      None
+  @scala.annotation.varargs
+  def apply(exprs: Column*): Column = {
+    Column(AggregateExpression(scalaAggregator(exprs.map(_.expr)), Complete, isDistinct = false))
+  }
+
+  // This is also used by udf.register(...) when it detects a UserDefinedAggregator
+  def scalaAggregator(exprs: Seq[Expression]): ScalaAggregator[IN, BUF, OUT] = {
+    val iEncoder = inputEncoder.asInstanceOf[ExpressionEncoder[IN]]
+    ScalaAggregator(exprs, aggregator, iEncoder, nullable, deterministic)
+  }
+
+  override def withName(name: String): UserDefinedAggregator[IN, BUF, OUT] = {
+    copy(name = Option(name))
+  }
+
+  override def asNonNullable(): UserDefinedAggregator[IN, BUF, OUT] = {
+    if (!nullable) {
+      this
     } else {
-      Some(inputSchemas.map(_.get.dataType))
+      copy(nullable = false)
     }
-    val nullableTypes = Some(inputSchemas.map(_.map(_.nullable).getOrElse(true)))
-    SparkUserDefinedFunction(f, dataType, inputTypes, nullableTypes)
+  }
+
+  override def asNondeterministic(): UserDefinedAggregator[IN, BUF, OUT] = {
+    if (!deterministic) {
+      this
+    } else {
+      copy(deterministic = false)
+    }
   }
 }

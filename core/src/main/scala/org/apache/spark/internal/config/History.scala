@@ -49,6 +49,11 @@ private[spark] object History {
     .timeConf(TimeUnit.SECONDS)
     .createWithDefaultString("7d")
 
+  val MAX_LOG_NUM = ConfigBuilder("spark.history.fs.cleaner.maxNum")
+    .doc("The maximum number of log files in the event log directory.")
+    .intConf
+    .createWithDefault(Int.MaxValue)
+
   val LOCAL_STORE_DIR = ConfigBuilder("spark.history.store.path")
     .doc("Local directory where to cache application history information. By default this is " +
       "not set, meaning all history information will be kept in memory.")
@@ -79,6 +84,25 @@ private[spark] object History {
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("1m")
 
+  private[spark] val EVENT_LOG_ROLLING_MAX_FILES_TO_RETAIN =
+    ConfigBuilder("spark.history.fs.eventLog.rolling.maxFilesToRetain")
+      .doc("The maximum number of event log files which will be retained as non-compacted. " +
+        "By default, all event log files will be retained. Please set the configuration " +
+        s"and ${EVENT_LOG_ROLLING_MAX_FILE_SIZE.key} accordingly if you want to control " +
+        "the overall size of event log files.")
+      .intConf
+      .checkValue(_ > 0, "Max event log files to retain should be higher than 0.")
+      .createWithDefault(Integer.MAX_VALUE)
+
+  private[spark] val EVENT_LOG_COMPACTION_SCORE_THRESHOLD =
+    ConfigBuilder("spark.history.fs.eventLog.rolling.compaction.score.threshold")
+      .doc("The threshold score to determine whether it's good to do the compaction or not. " +
+        "The compaction score is calculated in analyzing, and being compared to this value. " +
+        "Compaction will proceed only when the score is higher than the threshold value.")
+      .internal()
+      .doubleConf
+      .createWithDefault(0.7d)
+
   val DRIVER_LOG_CLEANER_ENABLED = ConfigBuilder("spark.history.fs.driverlog.cleaner.enabled")
     .fallbackConf(CLEANER_ENABLED)
 
@@ -88,17 +112,19 @@ private[spark] object History {
   val MAX_DRIVER_LOG_AGE_S = ConfigBuilder("spark.history.fs.driverlog.cleaner.maxAge")
     .fallbackConf(MAX_LOG_AGE_S)
 
-  val UI_ACLS_ENABLE = ConfigBuilder("spark.history.ui.acls.enable")
+  val HISTORY_SERVER_UI_ACLS_ENABLE = ConfigBuilder("spark.history.ui.acls.enable")
     .booleanConf
     .createWithDefault(false)
 
-  val UI_ADMIN_ACLS = ConfigBuilder("spark.history.ui.admin.acls")
+  val HISTORY_SERVER_UI_ADMIN_ACLS = ConfigBuilder("spark.history.ui.admin.acls")
     .stringConf
-    .createWithDefault("")
+    .toSequence
+    .createWithDefault(Nil)
 
-  val UI_ADMIN_ACLS_GROUPS = ConfigBuilder("spark.history.ui.admin.acls.groups")
+  val HISTORY_SERVER_UI_ADMIN_ACLS_GROUPS = ConfigBuilder("spark.history.ui.admin.acls.groups")
     .stringConf
-    .createWithDefault("")
+    .toSequence
+    .createWithDefault(Nil)
 
   val NUM_REPLAY_THREADS = ConfigBuilder("spark.history.fs.numReplayThreads")
     .intConf
@@ -123,4 +149,22 @@ private[spark] object History {
   val KERBEROS_KEYTAB = ConfigBuilder("spark.history.kerberos.keytab")
     .stringConf
     .createOptional
+
+  val CUSTOM_EXECUTOR_LOG_URL = ConfigBuilder("spark.history.custom.executor.log.url")
+    .doc("Specifies custom spark executor log url for supporting external log service instead of " +
+      "using cluster managers' application log urls in the history server. Spark will support " +
+      "some path variables via patterns which can vary on cluster manager. Please check the " +
+      "documentation for your cluster manager to see which patterns are supported, if any. " +
+      "This configuration has no effect on a live application, it only affects the history server.")
+    .stringConf
+    .createOptional
+
+  val APPLY_CUSTOM_EXECUTOR_LOG_URL_TO_INCOMPLETE_APP =
+    ConfigBuilder("spark.history.custom.executor.log.url.applyIncompleteApplication")
+      .doc("Whether to apply custom executor log url, as specified by " +
+        "`spark.history.custom.executor.log.url`, to incomplete application as well. " +
+        "Even if this is true, this still only affects the behavior of the history server, " +
+        "not running spark applications.")
+      .booleanConf
+      .createWithDefault(true)
 }
