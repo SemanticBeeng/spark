@@ -236,9 +236,7 @@ class ContinuousExecution(
             startTrigger()
 
             if (reader.needsReconfiguration() && state.compareAndSet(ACTIVE, RECONFIGURING)) {
-              stopSources()
               if (queryExecutionThread.isAlive) {
-                sparkSession.sparkContext.cancelJobGroup(runId.toString)
                 queryExecutionThread.interrupt()
               }
               false
@@ -266,12 +264,36 @@ class ContinuousExecution(
         SQLExecution.withNewExecutionId(
           sparkSessionForQuery, lastExecution)(lastExecution.toRdd)
       }
+    } catch {
+      case t: Throwable
+          if StreamExecution.isInterruptionException(t) && state.get() == RECONFIGURING =>
+        logInfo(s"Query $id ignoring exception from reconfiguring: $t")
+        // interrupted by reconfiguration - swallow exception so we can restart the query
     } finally {
-      epochEndpoint.askSync[Unit](StopContinuousExecutionWrites)
-      SparkEnv.get.rpcEnv.stop(epochEndpoint)
-
-      epochUpdateThread.interrupt()
-      epochUpdateThread.join()
+      // The above execution may finish before getting interrupted, for example, a Spark job having
+      // 0 partitions will complete immediately. Then the interrupted status will sneak here.
+      //
+      // To handle this case, we do the two things here:
+      //
+      // 1. Clean up the resources in `queryExecutionThread.runUninterruptibly`. This may increase
+      //    the waiting time of `stop` but should be minor because the operations here are very fast
+      //    (just sending an RPC message in the same process and stopping a very simple thread).
+      // 2. Clear the interrupted status at the end so that it won't impact the `runContinuous`
+      //    call. We may clear the interrupted status set by `stop`, but it doesn't affect the query
+      //    termination because `runActivatedStream` will check `state` and exit accordingly.
+      queryExecutionThread.runUninterruptibly {
+        try {
+          epochEndpoint.askSync[Unit](StopContinuousExecutionWrites)
+        } finally {
+          SparkEnv.get.rpcEnv.stop(epochEndpoint)
+          epochUpdateThread.interrupt()
+          epochUpdateThread.join()
+          stopSources()
+          // The following line must be the last line because it may fail if SparkContext is stopped
+          sparkSession.sparkContext.cancelJobGroup(runId.toString)
+        }
+      }
+      Thread.interrupted()
     }
   }
 
@@ -355,6 +377,22 @@ class ContinuousExecution(
         awaitProgressLock.unlock()
       }
     }
+  }
+
+  /**
+   * Stops the query execution thread to terminate the query.
+   */
+  override def stop(): Unit = {
+    // Set the state to TERMINATED so that the batching thread knows that it was interrupted
+    // intentionally
+    state.set(TERMINATED)
+    if (queryExecutionThread.isAlive) {
+      // The query execution thread will clean itself up in the finally clause of runContinuous.
+      // We just need to interrupt the long running job.
+      queryExecutionThread.interrupt()
+      queryExecutionThread.join()
+    }
+    logInfo(s"Query $prettyIdString was stopped")
   }
 }
 

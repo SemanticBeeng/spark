@@ -27,6 +27,7 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.catalyst.util.StringUtils
 import org.apache.spark.sql.execution.aggregate
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, SortAggregateExec}
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, CartesianProductExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -2868,6 +2869,61 @@ class SQLQuerySuite extends QueryTest with SharedSQLContext {
         checkAnswer(df.except(dfIn_a), df.except(dfIn_b))
       }
     }
+  }
+
+  test("SPARK-26709: OptimizeMetadataOnlyQuery does not handle empty records correctly") {
+    Seq(true, false).foreach { enableOptimizeMetadataOnlyQuery =>
+      withSQLConf(SQLConf.OPTIMIZER_METADATA_ONLY.key -> enableOptimizeMetadataOnlyQuery.toString) {
+        withTempPath { path =>
+          val tabLocation = path.getCanonicalPath
+          val partLocation1 = tabLocation + "/p=3"
+          val partLocation2 = tabLocation + "/p=1"
+          // SPARK-23271 empty RDD when saved should write a metadata only file
+          val df = spark.range(10).filter($"id" < 0).toDF("col")
+          df.write.parquet(partLocation1)
+          val df2 = spark.range(10).toDF("col")
+          df2.write.parquet(partLocation2)
+          val readDF = spark.read.parquet(tabLocation)
+          if (enableOptimizeMetadataOnlyQuery) {
+            // The result is wrong if we enable the configuration.
+            checkAnswer(readDF.selectExpr("max(p)"), Row(3))
+          } else {
+            checkAnswer(readDF.selectExpr("max(p)"), Row(1))
+          }
+          checkAnswer(readDF.selectExpr("max(col)"), Row(9))
+        }
+      }
+    }
+  }
+
+  test("SPARK-28156: self-join should not miss cached view") {
+    withTable("table1") {
+      withView("table1_vw") {
+        val df = Seq.tabulate(5) { x => (x, x + 1, x + 2, x + 3) }.toDF("a", "b", "c", "d")
+        df.write.mode("overwrite").format("parquet").saveAsTable("table1")
+        sql("drop view if exists table1_vw")
+        sql("create view table1_vw as select * from table1")
+
+        val cachedView = sql("select a, b, c, d from table1_vw")
+
+        cachedView.createOrReplaceTempView("cachedview")
+        cachedView.persist()
+
+        val queryDf = sql(
+          s"""select leftside.a, leftside.b
+             |from cachedview leftside
+             |join cachedview rightside
+             |on leftside.a = rightside.a
+           """.stripMargin)
+
+        val inMemoryTableScan = queryDf.queryExecution.executedPlan.collect {
+          case i: InMemoryTableScanExec => i
+        }
+        assert(inMemoryTableScan.size == 2)
+        checkAnswer(queryDf, Row(0, 1) :: Row(1, 2) :: Row(2, 3) :: Row(3, 4) :: Row(4, 5) :: Nil)
+      }
+    }
+
   }
 }
 
