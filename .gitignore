@@ -60,6 +60,7 @@ project/plugins/lib_managed/
 project/plugins/project/build.properties
 project/plugins/src_managed/
 project/plugins/target/
+project/.boot
 python/lib/pyspark.zip
 python/deps
 python/pyspark/python

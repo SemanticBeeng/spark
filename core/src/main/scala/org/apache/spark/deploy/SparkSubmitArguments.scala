@@ -397,7 +397,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
         driverExtraJavaOptions = value
 
       case DRIVER_LIBRARY_PATH =>
-        driverExtraLibraryPath = value
+        driverExtrasparke = value
 
       case PROPERTIES_FILE =>
         propertiesFile = value
