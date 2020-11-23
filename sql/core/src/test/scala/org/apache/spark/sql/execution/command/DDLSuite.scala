@@ -28,8 +28,8 @@ import org.apache.spark.{SparkException, SparkFiles}
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.RDD_PARALLEL_LISTING_THRESHOLD
 import org.apache.spark.sql.{AnalysisException, QueryTest, Row, SaveMode}
-import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, NoSuchDatabaseException, NoSuchPartitionException, NoSuchTableException, TempTableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, QualifiedTableName, TableIdentifier}
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, NoSuchDatabaseException, NoSuchFunctionException, NoSuchPartitionException, NoSuchTableException, TempTableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
@@ -188,7 +188,7 @@ class InMemoryCatalogedDDLSuite extends DDLSuite with SharedSparkSession {
     withTable("t") {
       sql("CREATE TABLE t(i INT) USING parquet")
       val e = intercept[AnalysisException] {
-        sql("ALTER TABLE t ALTER COLUMN i TYPE INT FIRST")
+        sql("ALTER TABLE t ALTER COLUMN i FIRST")
       }
       assert(e.message.contains("ALTER COLUMN ... FIRST | ALTER is only supported with v2 tables"))
     }
@@ -473,17 +473,12 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
       withEmptyDirInTablePath("tab1") { tableLoc =>
         val hiddenGarbageFile = new File(tableLoc.getCanonicalPath, ".garbage")
         hiddenGarbageFile.createNewFile()
-        val exMsg = "Can not create the managed table('`tab1`'). The associated location"
         val exMsgWithDefaultDB =
           "Can not create the managed table('`default`.`tab1`'). The associated location"
         var ex = intercept[AnalysisException] {
           sql(s"CREATE TABLE tab1 USING ${dataSource} AS SELECT 1, 'a'")
         }.getMessage
-        if (isUsingHiveMetastore) {
-          assert(ex.contains(exMsgWithDefaultDB))
-        } else {
-          assert(ex.contains(exMsg))
-        }
+        assert(ex.contains(exMsgWithDefaultDB))
 
         ex = intercept[AnalysisException] {
           sql(s"CREATE TABLE tab1 (col1 int, col2 string) USING ${dataSource}")
@@ -509,8 +504,8 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
         val ex = intercept[AnalysisException] {
           sql("ALTER TABLE tab1 RENAME TO tab2")
         }.getMessage
-        val expectedMsg = "Can not rename the managed table('`tab1`'). The associated location"
-        assert(ex.contains(expectedMsg))
+        assert(ex.contains(
+          "Can not rename the managed table('`default`.`tab1`'). The associated location"))
       }
     }
   }
@@ -640,7 +635,8 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
         val errMsg = intercept[AnalysisException] {
           sql(s"CREATE TABLE t($c0 INT, $c1 INT) USING parquet")
         }.getMessage
-        assert(errMsg.contains("Found duplicate column(s) in the table definition of `t`"))
+        assert(errMsg.contains(
+          "Found duplicate column(s) in the table definition of `default`.`t`"))
       }
     }
   }
@@ -649,7 +645,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     val e = intercept[AnalysisException] {
       sql("CREATE TABLE tbl(a int, b string) USING json PARTITIONED BY (c)")
     }
-    assert(e.message == "partition column c is not defined in table tbl, " +
+    assert(e.message == "partition column c is not defined in table default.tbl, " +
       "defined table columns are: a, b")
   }
 
@@ -657,7 +653,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     val e = intercept[AnalysisException] {
       sql("CREATE TABLE tbl(a int, b string) USING json CLUSTERED BY (c) INTO 4 BUCKETS")
     }
-    assert(e.message == "bucket column c is not defined in table tbl, " +
+    assert(e.message == "bucket column c is not defined in table default.tbl, " +
       "defined table columns are: a, b")
   }
 
@@ -1037,7 +1033,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     df.write.insertInto("students")
     spark.catalog.cacheTable("students")
     checkAnswer(spark.table("students"), df)
-    assume(spark.catalog.isCached("students"), "bad test: table was not cached in the first place")
+    assert(spark.catalog.isCached("students"), "bad test: table was not cached in the first place")
     sql("ALTER TABLE students RENAME TO teachers")
     sql("CREATE TABLE students (age INT, name STRING) USING parquet")
     // Now we have both students and teachers.
@@ -1207,14 +1203,24 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
   }
 
   test("alter table: recover partitions (sequential)") {
-    withSQLConf(RDD_PARALLEL_LISTING_THRESHOLD.key -> "10") {
+    val oldRddParallelListingThreshold = spark.sparkContext.conf.get(
+      RDD_PARALLEL_LISTING_THRESHOLD)
+    try {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD.key, "10")
       testRecoverPartitions()
+    } finally {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD, oldRddParallelListingThreshold)
     }
   }
 
   test("alter table: recover partition (parallel)") {
-    withSQLConf(RDD_PARALLEL_LISTING_THRESHOLD.key -> "0") {
+    val oldRddParallelListingThreshold = spark.sparkContext.conf.get(
+      RDD_PARALLEL_LISTING_THRESHOLD)
+    try {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD.key, "0")
       testRecoverPartitions()
+    } finally {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD, oldRddParallelListingThreshold)
     }
   }
 
@@ -1786,7 +1792,8 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
       column.map(_.metadata).getOrElse(Metadata.empty)
     }
     // Ensure that change column will preserve other metadata fields.
-    sql("ALTER TABLE dbx.tab1 CHANGE COLUMN col1 TYPE INT COMMENT 'this is col1'")
+    sql("ALTER TABLE dbx.tab1 CHANGE COLUMN col1 TYPE INT")
+    sql("ALTER TABLE dbx.tab1 CHANGE COLUMN col1 COMMENT 'this is col1'")
     assert(getMetadata("col1").getString("key") == "value")
     assert(getMetadata("col1").getString("comment") == "this is col1")
   }
@@ -1856,6 +1863,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             "Returns the concatenation of col1, col2, ..., colN.") :: Nil
     )
     // extended mode
+    // scalastyle:off whitespace.end.of.line
     checkAnswer(
       sql("DESCRIBE FUNCTION EXTENDED ^"),
       Row("Class: org.apache.spark.sql.catalyst.expressions.BitwiseXor") ::
@@ -1864,11 +1872,14 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             |    Examples:
             |      > SELECT 3 ^ 5;
             |       6
-            |  """.stripMargin) ::
+            |  
+            |    Since: 1.4.0
+            |""".stripMargin) ::
         Row("Function: ^") ::
         Row("Usage: expr1 ^ expr2 - Returns the result of " +
           "bitwise exclusive OR of `expr1` and `expr2`.") :: Nil
     )
+    // scalastyle:on whitespace.end.of.line
   }
 
   test("create a data source table without schema") {
@@ -1962,7 +1973,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     Seq("json", "parquet").foreach { format =>
       withTable("rectangles") {
         data.write.format(format).saveAsTable("rectangles")
-        assume(spark.table("rectangles").collect().nonEmpty,
+        assert(spark.table("rectangles").collect().nonEmpty,
           "bad test; table was empty to begin with")
 
         sql("TRUNCATE TABLE rectangles")
@@ -2015,7 +2026,6 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
   }
 
   test("SPARK-30312: truncate table - keep acl/permission") {
-    import testImplicits._
     val ignorePermissionAcl = Seq(true, false)
 
     ignorePermissionAcl.foreach { ignore =>
@@ -2041,6 +2051,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
           // Set ACL to table path.
           val customAcl = new java.util.ArrayList[AclEntry]()
           customAcl.add(new AclEntry.Builder()
+            .setName("test")
             .setType(AclEntryType.USER)
             .setScope(AclEntryScope.ACCESS)
             .setPermission(FsAction.READ).build())
@@ -2060,10 +2071,49 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
           if (ignore) {
             assert(aclEntries.size() == 0)
           } else {
-            assert(aclEntries.size() == 1)
+            assert(aclEntries.size() == 4)
             assert(aclEntries.get(0) == customAcl.get(0))
+
+            // Setting ACLs will also set user/group/other permissions
+            // as ACL entries.
+            val user = new AclEntry.Builder()
+              .setType(AclEntryType.USER)
+              .setScope(AclEntryScope.ACCESS)
+              .setPermission(FsAction.ALL).build()
+            val group = new AclEntry.Builder()
+              .setType(AclEntryType.GROUP)
+              .setScope(AclEntryScope.ACCESS)
+              .setPermission(FsAction.ALL).build()
+            val other = new AclEntry.Builder()
+              .setType(AclEntryType.OTHER)
+              .setScope(AclEntryScope.ACCESS)
+              .setPermission(FsAction.ALL).build()
+            assert(aclEntries.get(1) == user)
+            assert(aclEntries.get(2) == group)
+            assert(aclEntries.get(3) == other)
           }
         }
+      }
+    }
+  }
+
+  test("SPARK-31163: acl/permission should handle non-existed path when truncating table") {
+    withSQLConf(SQLConf.TRUNCATE_TABLE_IGNORE_PERMISSION_ACL.key -> "false") {
+      withTable("tab1") {
+        sql("CREATE TABLE tab1 (col1 STRING, col2 INT) USING parquet PARTITIONED BY (col2)")
+        sql("INSERT INTO tab1 SELECT 'one', 1")
+        checkAnswer(spark.table("tab1"), Row("one", 1))
+        val part = spark.sessionState.catalog.listPartitions(TableIdentifier("tab1")).head
+        val path = new File(part.location.getPath)
+        sql("TRUNCATE TABLE tab1")
+        // simulate incomplete/unsuccessful truncate
+        assert(path.exists())
+        path.delete()
+        assert(!path.exists())
+        // execute without java.io.FileNotFoundException
+        sql("TRUNCATE TABLE tab1")
+        // partition path should be re-created
+        assert(path.exists())
       }
     }
   }
@@ -2966,21 +3016,92 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     }
   }
 
-  test("Add a directory when spark.sql.legacy.addDirectory.recursive.enabled set to true") {
+  test(s"Add a directory when ${SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key} set to false") {
     val directoryToAdd = Utils.createTempDir("/tmp/spark/addDirectory/")
     val testFile = File.createTempFile("testFile", "1", directoryToAdd)
     spark.sql(s"ADD FILE $directoryToAdd")
     assert(new File(SparkFiles.get(s"${directoryToAdd.getName}/${testFile.getName}")).exists())
   }
 
-  test("Add a directory when spark.sql.legacy.addDirectory.recursive.enabled not set to true") {
+  test(s"Add a directory when ${SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key} set to true") {
     withTempDir { testDir =>
-      withSQLConf(SQLConf.LEGACY_ADD_DIRECTORY_USING_RECURSIVE.key -> "false") {
+      withSQLConf(SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key -> "true") {
         val msg = intercept[SparkException] {
           spark.sql(s"ADD FILE $testDir")
         }.getMessage
         assert(msg.contains("is a directory and recursive is not turned on"))
       }
+    }
+  }
+
+  test("REFRESH FUNCTION") {
+    val msg = intercept[AnalysisException] {
+      sql("REFRESH FUNCTION md5")
+    }.getMessage
+    assert(msg.contains("Cannot refresh built-in function"))
+    val msg2 = intercept[NoSuchFunctionException] {
+      sql("REFRESH FUNCTION default.md5")
+    }.getMessage
+    assert(msg2.contains(s"Undefined function: 'md5'. This function is neither a registered " +
+      s"temporary function nor a permanent function registered in the database 'default'."))
+
+    withUserDefinedFunction("func1" -> true) {
+      sql("CREATE TEMPORARY FUNCTION func1 AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      val msg = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION func1")
+      }.getMessage
+      assert(msg.contains("Cannot refresh temporary function"))
+    }
+
+    withUserDefinedFunction("func1" -> false) {
+      val func = FunctionIdentifier("func1", Some("default"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func1")
+      }
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+
+      sql("CREATE FUNCTION func1 AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      sql("REFRESH FUNCTION func1")
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+      val msg = intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func2")
+      }.getMessage
+      assert(msg.contains(s"Undefined function: 'func2'. This function is neither a registered " +
+        s"temporary function nor a permanent function registered in the database 'default'."))
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+
+      spark.sessionState.catalog.externalCatalog.dropFunction("default", "func1")
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+      intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func1")
+      }
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+
+      val function = CatalogFunction(func, "test.non.exists.udf", Seq.empty)
+      spark.sessionState.catalog.createFunction(function, false)
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      val err = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION func1")
+      }.getMessage
+      assert(err.contains("Can not load class"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+    }
+  }
+
+  test("REFRESH FUNCTION persistent function with the same name as the built-in function") {
+    withUserDefinedFunction("default.rand" -> false) {
+      val rand = FunctionIdentifier("rand", Some("default"))
+      sql("CREATE FUNCTION rand AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      assert(!spark.sessionState.catalog.isRegisteredFunction(rand))
+      val msg = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION rand")
+      }.getMessage
+      assert(msg.contains("Cannot refresh built-in function"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(rand))
+      sql("REFRESH FUNCTION default.rand")
+      assert(spark.sessionState.catalog.isRegisteredFunction(rand))
     }
   }
 }

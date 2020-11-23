@@ -26,6 +26,7 @@ import org.apache.spark.sql.catalyst.optimizer.BooleanSimplification
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.util.TypeUtils
+import org.apache.spark.sql.connector.catalog.{SupportsAtomicPartitionManagement, SupportsPartitionManagement, Table}
 import org.apache.spark.sql.connector.catalog.TableChange.{AddColumn, After, ColumnPosition, DeleteColumn, RenameColumn, UpdateColumnComment, UpdateColumnNullability, UpdateColumnPosition, UpdateColumnType}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -97,7 +98,7 @@ trait CheckAnalysis extends PredicateHelper {
         u.failAnalysis(s"Namespace not found: ${u.multipartIdentifier.quoted}")
 
       case u: UnresolvedTable =>
-        u.failAnalysis(s"Table not found: ${u.multipartIdentifier.quoted}")
+        u.failAnalysis(s"Table not found for '${u.commandName}': ${u.multipartIdentifier.quoted}")
 
       case u: UnresolvedTableOrView =>
         u.failAnalysis(s"Table or view not found: ${u.multipartIdentifier.quoted}")
@@ -107,6 +108,11 @@ trait CheckAnalysis extends PredicateHelper {
 
       case InsertIntoStatement(u: UnresolvedRelation, _, _, _, _) =>
         failAnalysis(s"Table not found: ${u.multipartIdentifier.quoted}")
+
+      // TODO (SPARK-27484): handle streaming write commands when we have them.
+      case write: V2WriteCommand if write.table.isInstanceOf[UnresolvedRelation] =>
+        val tblName = write.table.asInstanceOf[UnresolvedRelation].multipartIdentifier
+        write.table.failAnalysis(s"Table or view not found: ${tblName.quoted}")
 
       case u: UnresolvedV2Relation if isView(u.originalNameParts) =>
         u.failAnalysis(
@@ -158,20 +164,26 @@ trait CheckAnalysis extends PredicateHelper {
           case g: GroupingID =>
             failAnalysis("grouping_id() can only be used with GroupingSets/Cube/Rollup")
 
+          case e: Expression if e.children.exists(_.isInstanceOf[WindowFunction]) &&
+              !e.isInstanceOf[WindowExpression] =>
+            val w = e.children.find(_.isInstanceOf[WindowFunction]).get
+            failAnalysis(s"Window function $w requires an OVER clause.")
+
           case w @ WindowExpression(AggregateExpression(_, _, true, _, _), _) =>
             failAnalysis(s"Distinct window functions are not supported: $w")
 
-          case w @ WindowExpression(_: OffsetWindowFunction,
+          case w @ WindowExpression(wf: FrameLessOffsetWindowFunction,
             WindowSpecDefinition(_, order, frame: SpecifiedWindowFrame))
              if order.isEmpty || !frame.isOffset =>
-            failAnalysis("An offset window function can only be evaluated in an ordered " +
+            failAnalysis(s"${wf.prettyName} function can only be evaluated in an ordered " +
               s"row-based window frame with a single offset: $w")
 
           case w @ WindowExpression(e, s) =>
             // Only allow window functions with an aggregate expression or an offset window
             // function or a Pandas window UDF.
             e match {
-              case _: AggregateExpression | _: OffsetWindowFunction | _: AggregateWindowFunction =>
+              case _: AggregateExpression | _: FrameLessOffsetWindowFunction |
+                  _: AggregateWindowFunction =>
                 w
               case f: PythonUDF if PythonUDF.isWindowPandasUDF(f) =>
                 w
@@ -199,10 +211,6 @@ trait CheckAnalysis extends PredicateHelper {
             failAnalysis(
               s"filter expression '${f.condition.sql}' " +
                 s"of type ${f.condition.dataType.catalogString} is not a boolean.")
-
-          case Filter(condition, _) if hasNullAwarePredicateWithinNot(condition) =>
-            failAnalysis("Null-aware predicate sub-queries cannot be used in nested " +
-              s"conditions: $condition")
 
           case j @ Join(_, _, _, Some(condition), _) if condition.dataType != BooleanType =>
             failAnalysis(
@@ -308,6 +316,9 @@ trait CheckAnalysis extends PredicateHelper {
                 case a: AggregateExpression if a.isDistinct =>
                   e.failAnalysis(
                     "distinct aggregates are not allowed in observed metrics, but found: " + s.sql)
+                case a: AggregateExpression if a.filter.isDefined =>
+                  e.failAnalysis("aggregates with filter predicate are not allowed in " +
+                    "observed metrics, but found: " + s.sql)
                 case _: Attribute if !seenAggregate =>
                   e.failAnalysis (s"attribute ${s.sql} can only be used as an argument to an " +
                     "aggregate function.")
@@ -338,7 +349,8 @@ trait CheckAnalysis extends PredicateHelper {
             def ordinalNumber(i: Int): String = i match {
               case 0 => "first"
               case 1 => "second"
-              case i => s"${i}th"
+              case 2 => "third"
+              case i => s"${i + 1}th"
             }
             val ref = dataTypes(operator.children.head)
             operator.children.tail.zipWithIndex.foreach { case (child, ti) =>
@@ -437,12 +449,16 @@ trait CheckAnalysis extends PredicateHelper {
               }
               field.get._2
             }
-            def positionArgumentExists(position: ColumnPosition, struct: StructType): Unit = {
+            def positionArgumentExists(
+                position: ColumnPosition,
+                struct: StructType,
+                fieldsAdded: Seq[String]): Unit = {
               position match {
                 case after: After =>
-                  if (!struct.fieldNames.contains(after.column())) {
+                  val allFields = struct.fieldNames ++ fieldsAdded
+                  if (!allFields.contains(after.column())) {
                     alter.failAnalysis(s"Couldn't resolve positional argument $position amongst " +
-                      s"${struct.fieldNames.mkString("[", ", ", "]")}")
+                      s"${allFields.mkString("[", ", ", "]")}")
                   }
                 case _ =>
               }
@@ -470,12 +486,26 @@ trait CheckAnalysis extends PredicateHelper {
               }
             }
 
+            val colsToDelete = mutable.Set.empty[Seq[String]]
+            // 'colsToAdd' keeps track of new columns being added. It stores a mapping from a parent
+            // name of fields to field names that belong to the parent. For example, if we add
+            // columns "a.b.c", "a.b.d", and "a.c", 'colsToAdd' will become
+            // Map(Seq("a", "b") -> Seq("c", "d"), Seq("a") -> Seq("c")).
+            val colsToAdd = mutable.Map.empty[Seq[String], Seq[String]]
+
             alter.changes.foreach {
               case add: AddColumn =>
-                checkColumnNotExists("add", add.fieldNames(), table.schema)
+                // If a column to add is a part of columns to delete, we don't need to check
+                // if column already exists - applies to REPLACE COLUMNS scenario.
+                if (!colsToDelete.contains(add.fieldNames())) {
+                  checkColumnNotExists("add", add.fieldNames(), table.schema)
+                }
                 val parent = findParentStruct("add", add.fieldNames())
-                positionArgumentExists(add.position(), parent)
+                val parentName = add.fieldNames().init
+                val fieldsAdded = colsToAdd.getOrElse(parentName, Nil)
+                positionArgumentExists(add.position(), parent, fieldsAdded)
                 TypeUtils.failWithIntervalType(add.dataType())
+                colsToAdd(parentName) = fieldsAdded :+ add.fieldNames().last
               case update: UpdateColumnType =>
                 val field = findField("update", update.fieldNames)
                 val fieldName = update.fieldNames.quoted
@@ -514,7 +544,11 @@ trait CheckAnalysis extends PredicateHelper {
               case updatePos: UpdateColumnPosition =>
                 findField("update", updatePos.fieldNames)
                 val parent = findParentStruct("update", updatePos.fieldNames())
-                positionArgumentExists(updatePos.position(), parent)
+                val parentName = updatePos.fieldNames().init
+                positionArgumentExists(
+                  updatePos.position(),
+                  parent,
+                  colsToAdd.getOrElse(parentName, Nil))
               case rename: RenameColumn =>
                 findField("rename", rename.fieldNames)
                 checkColumnNotExists(
@@ -523,9 +557,19 @@ trait CheckAnalysis extends PredicateHelper {
                 findField("update", update.fieldNames)
               case delete: DeleteColumn =>
                 findField("delete", delete.fieldNames)
+                // REPLACE COLUMNS has deletes followed by adds. Remember the deleted columns
+                // so that add operations do not fail when the columns to add exist and they
+                // are to be deleted.
+                colsToDelete += delete.fieldNames
               case _ =>
               // no validation needed for set and remove property
             }
+
+          case AlterTableAddPartition(ResolvedTable(_, _, table), parts, _) =>
+            checkAlterTablePartition(table, parts)
+
+          case AlterTableDropPartition(ResolvedTable(_, _, table), parts, _, _, _) =>
+            checkAlterTablePartition(table, parts)
 
           case _ => // Fallbacks to the following checks
         }
@@ -836,7 +880,7 @@ trait CheckAnalysis extends PredicateHelper {
 
     // Simplify the predicates before validating any unsupported correlation patterns in the plan.
     AnalysisHelper.allowInvokingTransformsInAnalyzer { BooleanSimplification(sub).foreachUp {
-      // Whitelist operators allowed in a correlated subquery
+      // Approve operators allowed in a correlated subquery
       // There are 4 categories:
       // 1. Operators that are allowed anywhere in a correlated subquery, and,
       //    by definition of the operators, they either do not contain
@@ -938,5 +982,25 @@ trait CheckAnalysis extends PredicateHelper {
       case p =>
         failOnOuterReferenceInSubTree(p)
     }}
+  }
+
+  // Make sure that table is able to alter partition.
+  private def checkAlterTablePartition(
+      table: Table, parts: Seq[PartitionSpec]): Unit = {
+    (table, parts) match {
+      case (_, parts) if parts.exists(_.isInstanceOf[UnresolvedPartitionSpec]) =>
+        failAnalysis("PartitionSpecs are not resolved")
+
+      case (table, _) if !table.isInstanceOf[SupportsPartitionManagement] =>
+        failAnalysis(s"Table ${table.name()} can not alter partitions.")
+
+      // Skip atomic partition tables
+      case (_: SupportsAtomicPartitionManagement, _) =>
+      case (_: SupportsPartitionManagement, parts) if parts.size > 1 =>
+        failAnalysis(
+          s"Nonatomic partition table ${table.name()} can not alter multiple partitions.")
+
+      case _ =>
+    }
   }
 }

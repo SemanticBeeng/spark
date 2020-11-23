@@ -129,6 +129,40 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
     assert(TestSparkPlugin.driverPlugin != null)
   }
 
+  test("SPARK-33088: executor tasks trigger plugin calls") {
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local[1]")
+      .set(PLUGINS, Seq(classOf[TestSparkPlugin].getName()))
+
+    sc = new SparkContext(conf)
+    sc.parallelize(1 to 10, 2).count()
+
+    assert(TestSparkPlugin.executorPlugin.numOnTaskStart == 2)
+    assert(TestSparkPlugin.executorPlugin.numOnTaskSucceeded == 2)
+    assert(TestSparkPlugin.executorPlugin.numOnTaskFailed == 0)
+  }
+
+  test("SPARK-33088: executor failed tasks trigger plugin calls") {
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local[1]")
+      .set(PLUGINS, Seq(classOf[TestSparkPlugin].getName()))
+
+    sc = new SparkContext(conf)
+    try {
+      sc.parallelize(1 to 10, 2).foreach(i => throw new RuntimeException)
+    } catch {
+      case t: Throwable => // ignore exception
+    }
+
+    eventually(timeout(10.seconds), interval(100.millis)) {
+      assert(TestSparkPlugin.executorPlugin.numOnTaskStart == 2)
+      assert(TestSparkPlugin.executorPlugin.numOnTaskSucceeded == 0)
+      assert(TestSparkPlugin.executorPlugin.numOnTaskFailed == 2)
+    }
+  }
+
   test("plugin initialization in non-local mode") {
     val path = Utils.createTempDir()
 
@@ -139,7 +173,7 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
       .set(NonLocalModeSparkPlugin.TEST_PATH_CONF, path.getAbsolutePath())
 
     sc = new SparkContext(conf)
-    TestUtils.waitUntilExecutorsUp(sc, 2, 10000)
+    TestUtils.waitUntilExecutorsUp(sc, 2, 60000)
 
     eventually(timeout(10.seconds), interval(100.millis)) {
       val children = path.listFiles()
@@ -169,7 +203,7 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
       sc = new SparkContext(conf)
 
       // Ensure all executors has started
-      TestUtils.waitUntilExecutorsUp(sc, 1, 10000)
+      TestUtils.waitUntilExecutorsUp(sc, 1, 60000)
 
       var children = Array.empty[File]
       eventually(timeout(10.seconds), interval(100.millis)) {
@@ -309,6 +343,10 @@ private class TestDriverPlugin extends DriverPlugin {
 
 private class TestExecutorPlugin extends ExecutorPlugin {
 
+  var numOnTaskStart: Int = 0
+  var numOnTaskSucceeded: Int = 0
+  var numOnTaskFailed: Int = 0
+
   override def init(ctx: PluginContext, extraConf: JMap[String, String]): Unit = {
     ctx.metricRegistry().register("executorMetric", new Gauge[Int] {
       override def getValue(): Int = 84
@@ -316,6 +354,17 @@ private class TestExecutorPlugin extends ExecutorPlugin {
     TestSparkPlugin.executorContext = ctx
   }
 
+  override def onTaskStart(): Unit = {
+    numOnTaskStart += 1
+  }
+
+  override def onTaskSucceeded(): Unit = {
+    numOnTaskSucceeded += 1
+  }
+
+  override def onTaskFailed(failureReason: TaskFailedReason): Unit = {
+    numOnTaskFailed += 1
+  }
 }
 
 private object TestSparkPlugin {
