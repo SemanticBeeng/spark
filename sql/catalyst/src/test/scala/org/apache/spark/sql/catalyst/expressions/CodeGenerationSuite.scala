@@ -104,7 +104,7 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("SPARK-22543: split large if expressions into blocks due to JVM code size limit") {
     var strExpr: Expression = Literal("abc")
     for (_ <- 1 to 150) {
-      strExpr = Decode(Encode(strExpr, "utf-8"), "utf-8")
+      strExpr = StringDecode(Encode(strExpr, "utf-8"), "utf-8")
     }
 
     val expressions = Seq(If(EqualTo(strExpr, strExpr), strExpr, strExpr))
@@ -560,10 +560,9 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 }
 
-case class HugeCodeIntExpression(value: Int) extends Expression {
+case class HugeCodeIntExpression(value: Int) extends LeafExpression {
   override def nullable: Boolean = true
   override def dataType: DataType = IntegerType
-  override def children: Seq[Expression] = Nil
   override def eval(input: InternalRow): Any = value
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     // Assuming HugeMethodLimit to be 8000

@@ -63,6 +63,8 @@ private[hive] class SparkExecuteStatementOperation(
     }
   }
 
+  private val forceCancel = sqlContext.conf.getConf(SQLConf.THRIFTSERVER_FORCE_CANCEL)
+
   private val substitutorStatement = SQLConf.withExistingConf(sqlContext.conf) {
     new VariableSubstitution().substitute(statement)
   }
@@ -118,14 +120,15 @@ private[hive] class SparkExecuteStatementOperation(
           (from.getAs[CalendarInterval](ordinal), CalendarIntervalType),
           false,
           timeFormatters)
-      case _: ArrayType | _: StructType | _: MapType | _: UserDefinedType[_] =>
+      case _: ArrayType | _: StructType | _: MapType | _: UserDefinedType[_] |
+          YearMonthIntervalType | DayTimeIntervalType =>
         to += toHiveString((from.get(ordinal), dataTypes(ordinal)), false, timeFormatters)
     }
   }
 
   def getNextRowSet(order: FetchOrientation, maxRowsL: Long): RowSet = withLocalProperties {
     try {
-      sqlContext.sparkContext.setJobGroup(statementId, substitutorStatement)
+      sqlContext.sparkContext.setJobGroup(statementId, substitutorStatement, forceCancel)
       getNextRowSetInternal(order, maxRowsL)
     } finally {
       sqlContext.sparkContext.clearJobGroup()
@@ -284,7 +287,7 @@ private[hive] class SparkExecuteStatementOperation(
         parentSession.getSessionState.getConf.setClassLoader(executionHiveClassLoader)
       }
 
-      sqlContext.sparkContext.setJobGroup(statementId, substitutorStatement)
+      sqlContext.sparkContext.setJobGroup(statementId, substitutorStatement, forceCancel)
       result = sqlContext.sql(statement)
       logDebug(result.queryExecution.toString())
       HiveThriftServer2.eventManager.onStatementParsed(statementId,
@@ -375,6 +378,8 @@ object SparkExecuteStatementOperation {
       val attrTypeString = field.dataType match {
         case NullType => "void"
         case CalendarIntervalType => StringType.catalogString
+        case YearMonthIntervalType => "interval_year_month"
+        case DayTimeIntervalType => "interval_day_time"
         case other => other.catalogString
       }
       new FieldSchema(field.name, attrTypeString, field.getComment.getOrElse(""))
